@@ -80,6 +80,20 @@ static void HardwareBar_draw(Meter* bar, int x, int y, int w) {
       bar->draw(bar, x, y, w);
 }
 
+static void HardwareBar_drawMemory(Meter* bar, int x, int y, int w) {
+   HardwareBar_draw(bar, x, y, w);
+   if (bar->mode != BAR_METERMODE || w <= 5 || y < 0 || y >= LINES)
+      return;
+
+   /* The native renderer colors every cell under the fill, including digits.
+    * Keep the ASCII capacity label one color when a nearly full bar crosses it.
+    * Three caption cells and two brackets leave w - 5 cells for the label. */
+   int length = MINIMUM((int)strlen(bar->txtBuffer), w - 5);
+   attrset(CRT_colors[METER_VALUE]);
+   mvaddnstr(y, x + w - 1 - length, bar->txtBuffer, length);
+   attrset(CRT_colors[RESET_COLOR]);
+}
+
 enum { GPU_CORE, GPU_MEMORY, GPU_TEMPERATURE, GPU_FAN, GPU_POWER, GPU_BARS };
 
 typedef struct NvidiaMeters_ {
@@ -112,8 +126,12 @@ static void NvidiaGPUsMeter_updateValues(Meter* this) {
          xSnprintf(bars[GPU_CORE]->txtBuffer, METER_TXTBUFFER_LEN, "%.1f%%", gpu->utilization);
       HardwareBar_value(bars[GPU_MEMORY], gpu->available ? gpu->memoryUsedMiB : NAN, gpu->memoryTotalMiB);
       bars[GPU_MEMORY]->curAttributes = memoryColor;
-      if (gpu->available && isfinite(gpu->memoryUsedMiB))
-         xSnprintf(bars[GPU_MEMORY]->txtBuffer, METER_TXTBUFFER_LEN, "%.0f/%.0fMiB", gpu->memoryUsedMiB, gpu->memoryTotalMiB);
+      if (gpu->available && isfinite(gpu->memoryUsedMiB)) {
+         char used[32], total[32];
+         Meter_humanUnit(used, gpu->memoryUsedMiB * 1024.0, sizeof(used));
+         Meter_humanUnit(total, gpu->memoryTotalMiB * 1024.0, sizeof(total));
+         xSnprintf(bars[GPU_MEMORY]->txtBuffer, METER_TXTBUFFER_LEN, "%s/%s", used, total);
+      }
       HardwareBar_temperature(bars[GPU_TEMPERATURE], gpu->available ? gpu->temperature : NAN);
       HardwareBar_value(bars[GPU_FAN], gpu->available ? gpu->fanPercent : NAN, 100);
       if (gpu->available && isfinite(gpu->fanPercent)) {
@@ -126,7 +144,7 @@ static void NvidiaGPUsMeter_updateValues(Meter* this) {
       HardwareBar_value(bars[GPU_POWER], gpu->available ? gpu->power : NAN, gpu->powerLimit);
       if (gpu->available && isfinite(gpu->power)) {
          if (isfinite(gpu->powerLimit)) {
-            xSnprintf(bars[GPU_POWER]->txtBuffer, METER_TXTBUFFER_LEN, "%.1f/%.0fW", gpu->power, gpu->powerLimit);
+            xSnprintf(bars[GPU_POWER]->txtBuffer, METER_TXTBUFFER_LEN, "%.1fW/%.0fW", gpu->power, gpu->powerLimit);
          } else {
             /* No invented limit: no filled bar when the driver cannot report it. */
             bars[GPU_POWER]->values[0] = NAN;
@@ -156,7 +174,7 @@ static void NvidiaGPUsMeter_draw(Meter* this, int x, int y, int w) {
       HardwareMeter_text(x, y, w, name, !gpu->available);
       Meter* const* bars = data->bars[i];
       HardwareBar_draw(bars[GPU_CORE], x, y + 1, w);
-      HardwareBar_draw(bars[GPU_MEMORY], x, y + 2, w);
+      HardwareBar_drawMemory(bars[GPU_MEMORY], x, y + 2, w);
       HardwareBar_draw(bars[GPU_TEMPERATURE], x, y + 3, w);
       HardwareBar_draw(bars[GPU_FAN], x, y + 4, w);
       HardwareBar_draw(bars[GPU_POWER], x, y + 5, w);
@@ -213,9 +231,9 @@ static void PowerCableMeter_updateValues(Meter* this) {
          xSnprintf(bar->txtBuffer, METER_TXTBUFFER_LEN, "%.2fV %.2fA %.1fW", reading->voltage[i], reading->current[i], reading->voltage[i] * reading->current[i]);
       }
    }
-   HardwareBar_value(data->power, reading->valid ? reading->power : NAN, 600);
+   HardwareBar_value(data->power, reading->valid ? reading->power : NAN, 1000);
    if (reading->valid)
-      xSnprintf(data->power->txtBuffer, METER_TXTBUFFER_LEN, "%.2fW /600W", reading->power);
+      xSnprintf(data->power->txtBuffer, METER_TXTBUFFER_LEN, "%.2fW/1000W", reading->power);
    HardwareBar_temperature(data->connector, reading->valid ? reading->connectorTemperature : NAN);
    HardwareBar_temperature(data->controller, reading->valid ? reading->controllerTemperature : NAN);
 }

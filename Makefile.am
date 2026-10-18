@@ -10,6 +10,12 @@ dist_man_MANS = htop.1
 EXTRA_DIST = \
 	$(dist_man_MANS) \
 	autogen.sh \
+	htop_plus \
+	htoprc.example \
+	install.sh \
+	uninstall.sh \
+	docs/htop_plus.md \
+	docs/htop_plus.1 \
 	htop.desktop \
 	htop.png \
 	htop.svg \

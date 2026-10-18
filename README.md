@@ -1,6 +1,7 @@
 # [![htop logo](htop-logo.png)](https://htop.dev)
 
 **htop_plus：NVIDIA GPU 与 5090 智能电源线仪表已集成，运行 `./htop_plus`。**
+系统安装：`sudo ./install.sh`，安装后直接运行 `htop_plus`；卸载：`sudo ./uninstall.sh`。
 Docker 进程的 USER 列显示 `[容器名]容器内用户名`，避免与宿主机相同 UID 混淆。
 中文使用、编译及验证说明见 [docs/htop_plus.md](docs/htop_plus.md)。
 

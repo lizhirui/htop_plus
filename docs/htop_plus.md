@@ -26,6 +26,46 @@ F10 或 q 退出。
 建议使用 120 列、32 行及以上终端，以便完整显示 96 个核心的百分比和进程列表。
 终端较窄时每核条内的文字会截断；可在 F2 调整 CPU 小列数量和布局。
 
+## 安装到系统目录
+
+```sh
+sudo ./install.sh
+htop_plus
+man htop_plus
+```
+
+脚本会在必要时执行 autogen、configure 和 make；编译依赖见后面的编译说明。
+已经完成编译时可使用 `sudo ./install.sh --no-build`，只安装现有程序。
+
+| 文件 | 默认安装位置 |
+| --- | --- |
+| 启动命令 | `/usr/local/bin/htop_plus` |
+| 修改版 htop 本体 | `/usr/local/libexec/htop_plus/htop` |
+| 默认界面模板 | `/usr/local/share/htop_plus/htoprc.example` |
+| 文档与许可证 | `/usr/local/share/doc/htop_plus/` |
+| man 手册 | `/usr/local/share/man/man1/htop_plus.1` |
+
+安装版在首次运行时创建 `${XDG_CONFIG_HOME:-$HOME/.config}/htop_plus/htoprc`，保存每个用户自己的布局。
+不会覆盖原版 `htop`、已有个人布局或 `/etc/nvpowermon/config.json`。
+更新时重新运行安装脚本，已运行的旧版进程可继续运行；重新启动命令后使用新版。
+源码目录里的 `./htop_plus` 仍使用源码目录的 `htoprc`。
+`HTOPRC` 可以显式指定其他布局文件。
+
+```sh
+# 卸载程序，保留个人配置与设备配置
+sudo ./uninstall.sh
+
+# 源码目录已删除时，也可以使用安装的卸载脚本
+sudo /usr/local/share/htop_plus/uninstall.sh
+
+# 自定义安装位置；卸载时指定同一个前缀
+sudo ./install.sh --prefix /opt/htop_plus
+sudo ./uninstall.sh --prefix /opt/htop_plus
+
+# 打包或验证，先安装到暂存目录
+DESTDIR=/tmp/htop_plus-package ./install.sh --no-build
+```
+
 ## Docker 进程用户
 
 Linux 上的 USER 列会显示 Docker 容器名和容器内用户名，例如 `[palworld-server-lxh]steam`。
@@ -55,10 +95,14 @@ Linux 上的 USER 列会显示 Docker 容器名和容器内用户名，例如 `[
 | --- | --- | --- |
 | GPU0/GPU1… | 显卡名称；索引来自 NVML | 文本 |
 | GPU | 核心利用率 | 100% |
-| VRM | 已用/总显存，MiB | 显存总量 |
+| VRM | 已用/总显存，按容量自动使用 K/M/G 等单位 | 显存总量 |
 | Tmp | GPU 温度，℃ | 100℃ |
 | Fan | 风扇百分比，支持时同时显示第 0 个风扇 RPM | 100% |
 | Pwr | GPU 整卡功率/驱动报告的当前功率上限，W | 驱动报告的功率上限 |
+
+斜杠两侧分别保留单位，例如 `31.4G/31.8G` 和 `28.4W/600W`。
+显存复用 htop 原生的容量格式化逻辑，例如 `519M/22.0G`，达到 1G 后使用 G。
+显存容量数字使用统一文字颜色，不随绿色占用条的填充位置改变颜色。
 
 运行时动态加载 `libnvidia-ml.so.1`，不需要 CUDA 开发包，不调用 `nvidia-smi` 子进程。
 最多展示 32 张 NVIDIA GPU，每次采集间隔至少 1 秒。
@@ -70,6 +114,7 @@ Linux 上的 USER 列会显示 Docker 容器名和容器内用户名，例如 `[
 ## 5090 外接电源线
 
 面板标题为 `5090 / 12V-2X6 Ti`。
+`Ti` 是外接智能线的型号后缀，不是显卡型号的一部分。
 数据来自外接的 WINGSTUDIO 智能线，与 GPU 索引独立；将它接到其他显卡时，标题不会自动识别接线对象。
 
 | 行 | 内容 |
@@ -79,7 +124,8 @@ Linux 上的 USER 列会显示 Docker 容器名和容器内用户名，例如 `[
 | Con | 接头温度 ℃ |
 | Ctl | 主控板温度 ℃ |
 
-电流条的固定显示刻度为 10A，总功率条为 600W，温度条为 100℃。
+电流条的固定显示刻度为 10A，总功率条为 1000W，温度条为 100℃。
+功率显示为 `实际线缆功率W/1000W`；1000W 按本机电源额定功率设置为图表刻度，读数仍然只覆盖外接线缆。
 这些刻度用于绘图，不是设备报警或保护配置，也不会修改硬件限值。
 各路功率由返回的电压、电流相乘，可能因设备内部计算和四舍五入而与设备总功率不完全相等。
 NVML 的整卡功率与外接线功率测量范围不同，分别显示。
@@ -125,6 +171,7 @@ CC=/usr/bin/gcc ./configure --enable-unicode
 make -j8
 python3 tests/test_hardware.py
 python3 tests/test_docker_users.py
+python3 tests/test_install.py
 ```
 
 需要 C 编译器、make、autoconf、automake、pkg-config，以及 ncurses、json-c 和 libcurl 开发包（Debian/Ubuntu 对应 `libncurses-dev libjson-c-dev libcurl4-openssl-dev`）。

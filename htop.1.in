@@ -673,7 +673,7 @@ It loads NVML at runtime; unsupported fields show N/A.
 shows the external WINGSTUDIO 12V-2X6 Ti cable's six voltage/current channels,
 computed per-channel watts, reported total watts, connector temperature (Con),
 and controller temperature (Ctl).
-Current bars use a fixed 10A scale, total power 600W, and temperature 100C;
+Current bars use a fixed 10A scale, total power 1000W, and temperature 100C;
 these are display scales, not hardware protection settings.
 Set
 .B HTOP_POWER_CABLE_PORT

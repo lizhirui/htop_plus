@@ -1,0 +1,62 @@
+.TH HTOP_PLUS 1 "2026" "htop_plus" "User Commands"
+.SH NAME
+htop_plus \- interactive process viewer with NVIDIA and power cable meters
+.SH SYNOPSIS
+.B htop_plus
+.RI [ htop-options ]
+.SH DESCRIPTION
+htop_plus extends htop with NVIDIA GPU sensors, Docker-aware process
+usernames, and a read-only WINGSTUDIO 12V-2X6 Ti cable meter.
+The USER column displays Docker owners as [container-name]container-user.
+The NVIDIA meter shows usage, used/total VRAM in K/M/G, temperature,
+fan percentage/RPM, and power in watts.
+The external cable meter shows six voltage/current/power channels,
+total cable power on a 1000W display scale, connector temperature (Con),
+and controller temperature (Ctl).
+The 1000W scale does not measure total PSU power or configure hardware limits.
+.PP
+Press F2 to configure meters and columns; press F10 or q to quit.
+Run htop_plus --help for the full list of supported htop command-line options.
+.SH OPTIONS
+.TP
+.B --readonly
+Disable process-changing operations.
+.TP
+.B --version
+Display the underlying htop version.
+.TP
+.B --help
+Display all supported command-line options.
+.SH ENVIRONMENT
+.TP
+.B HTOPRC
+Override the user interface configuration file.
+.TP
+.B XDG_CONFIG_HOME
+User configuration directory, defaulting to $HOME/.config.
+Installed htop_plus creates htop_plus/htoprc here on first run.
+Existing layouts are preserved during startup and upgrades.
+.TP
+.B HTOP_POWER_CABLE_CONFIG
+Select another connection configuration instead of /etc/nvpowermon/config.json.
+The USB serial number and optional VID/PID identify the current serial port.
+.TP
+.B HTOP_POWER_CABLE_PORT
+Override the configured connection with an absolute /dev/ path, or set
+to off to disable cable queries.
+.TP
+.B DOCKER_HOST
+Select a local Docker socket using unix:///path/to/docker.sock.
+.SH FILES
+.TP
+.I ~/.config/htop_plus/htoprc
+Per-user meter layout, independent of the original htop configuration.
+.TP
+.I /etc/nvpowermon/config.json
+Existing read-only intelligent cable connection settings.
+.SH NOTES
+The installer uses /usr/local by default and keeps the modified htop binary
+under libexec/htop_plus. It does not replace the system htop executable.
+The source checkout launcher keeps its layout in the source directory.
+.SH LICENSE
+GNU GPL version 2 or, at your option, any later version.
