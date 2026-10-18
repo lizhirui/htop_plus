@@ -1,0 +1,542 @@
+/*
+htop - Table.c
+(C) 2004,2005 Hisham H. Muhammad
+(C) 2023 htop dev team
+Released under the GNU GPLv2+, see the COPYING file
+in the source distribution for its full text.
+*/
+
+#include "config.h" // IWYU pragma: keep
+
+#include "Table.h"
+
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "CRT.h"
+#include "Hashtable.h"
+#include "Machine.h"
+#include "Macros.h"
+#include "Panel.h"
+#include "Row.h"
+#include "RowField.h"
+#include "Vector.h"
+
+
+Table* Table_init(Table* this, const ObjectClass* klass, Machine* host) {
+   this->rows = Vector_new(klass, true, VECTOR_DEFAULT_SIZE);
+   this->displayList = Vector_new(klass, false, VECTOR_DEFAULT_SIZE);
+   this->table = Hashtable_new(200, false);
+   this->needsSort = true;
+   this->following = -1;
+   this->stableId = -1;
+   this->stableLastIdx = 0;
+   this->pendingSelection = -1;
+   this->host = host;
+   return this;
+}
+
+void Table_preserveSelection(Table* this) {
+   Panel* panel = this->panel;
+   if (panel == NULL)
+      return;
+
+   const Row* selected = (const Row*) Panel_getSelected(panel);
+   if (selected)
+      this->pendingSelection = selected->id;
+}
+
+void Table_done(Table* this) {
+   Hashtable_delete(this->table);
+   Vector_delete(this->displayList);
+   Vector_delete(this->rows);
+}
+
+static void Table_delete(Object* cast) {
+   Table* this = (Table*) cast;
+   Table_done(this);
+   free(this);
+}
+
+void Table_setPanel(Table* this, Panel* panel) {
+   this->panel = panel;
+}
+
+void Table_add(Table* this, Row* row) {
+   assert(Vector_indexOf(this->rows, row, Row_idEqualCompare) == -1);
+   assert(Hashtable_get(this->table, row->id) == NULL);
+
+   // highlighting row found in first scan by first scan marked "far in the past"
+   row->seenStampMs = this->host->monotonicMs;
+
+   Vector_add(this->rows, row);
+   Hashtable_put(this->table, row->id, row);
+
+   assert(Vector_indexOf(this->rows, row, Row_idEqualCompare) != -1);
+   assert(Hashtable_get(this->table, row->id) != NULL);
+   assert(Vector_countEquals(this->rows, Hashtable_count(this->table)));
+}
+
+// Table_removeIndex removes a given row from the lists map and soft deletes
+// it from its vector. Vector_compact *must* be called once the caller is done
+// removing items.
+// Note: for processes should only be called from ProcessTable_iterate to avoid
+// breaking dying process highlighting.
+static void Table_removeIndex(Table* this, const Row* row, int idx) {
+   int rowid = row->id;
+   int rowparent = Row_getGroupOrParent(row);  /* save before row is freed */
+
+   assert(row == (Row*)Vector_get(this->rows, idx));
+   assert(Hashtable_get(this->table, rowid) != NULL);
+
+   Hashtable_remove(this->table, rowid);
+   Vector_softRemove(this->rows, idx);
+
+   if (this->following != -1 && this->following == rowid) {
+      this->following = -1;
+      Panel_setSelectionColor(this->panel, PANEL_SELECTION_FOCUS);
+   }
+
+   /* When the stable-tree-view anchor exits, walk up to its parent */
+   if (this->stableId != -1 && this->stableId == rowid) {
+      if (rowparent != 0 && rowparent != rowid &&
+          Hashtable_get(this->table, rowparent) != NULL) {
+         this->stableId = rowparent;
+      } else {
+         this->stableId = -1;
+      }
+   }
+
+   assert(Hashtable_get(this->table, rowid) == NULL);
+   assert(Vector_countEquals(this->rows, Hashtable_count(this->table)));
+}
+
+static void Table_buildTreeBranch(Table* this, int rowid, unsigned int level, int32_t indent, bool show) {
+   // Do not treat zero as root of any tree.
+   // (e.g. on OpenBSD the kernel thread 'swapper' has pid 0.)
+   if (rowid == 0)
+      return;
+
+   // The vector is sorted by parent, find the start of the range by bisection
+   int vsize = Vector_size(this->rows);
+   int l = 0;
+   int r = vsize;
+   while (l < r) {
+      int c = l + (r - l) / 2;
+      Row* row = (Row*)Vector_get(this->rows, c);
+      int parent = row->isRoot ? 0 : Row_getGroupOrParent(row);
+      if (parent < rowid) {
+         l = c + 1;
+      } else {
+         r = c;
+      }
+   }
+   // Find the end to know the last line for indent handling purposes
+   int lastShown = r;
+   while (r < vsize) {
+      Row* row = (Row*)Vector_get(this->rows, r);
+      if (!Row_isChildOf(row, rowid))
+         break;
+      if (row->show)
+         lastShown = r;
+      r++;
+   }
+
+   for (int i = l; i < r; i++) {
+      Row* row = (Row*)Vector_get(this->rows, i);
+
+      if (!show)
+         row->show = false;
+
+      Vector_add(this->displayList, row);
+
+      int32_t nextIndent = indent | ((int32_t)1 << MINIMUM(level, sizeof(row->indent) * 8 - 2));
+      Table_buildTreeBranch(this, row->id, level + 1, (i < lastShown) ? nextIndent : indent, row->show && row->showChildren);
+      if (i == lastShown)
+         row->indent = -nextIndent;
+      else
+         row->indent = nextIndent;
+
+      row->tree_depth = level + 1;
+   }
+}
+
+static int compareRowByKnownParentThenNatural(const void* v1, const void* v2) {
+   return Row_compareByParent((const Row*) v1, (const Row*) v2);
+}
+
+// Builds a sorted tree from scratch, without relying on previously gathered information
+static void Table_buildTree(Table* this) {
+   Vector_prune(this->displayList);
+
+   // Mark root processes
+   int vsize = Vector_size(this->rows);
+   for (int i = 0; i < vsize; i++) {
+      Row* row = (Row*) Vector_get(this->rows, i);
+      int parent = Row_getGroupOrParent(row);
+      row->isRoot = false;
+
+      if (row->id == parent) {
+         row->isRoot = true;
+         continue;
+      }
+
+      if (!parent) {
+         row->isRoot = true;
+         continue;
+      }
+
+      // We don't know about its parent for whatever reason
+      if (Table_findRow(this, parent) == NULL)
+         row->isRoot = true;
+   }
+
+   // Sort by known parent (roots first), then row ID
+   Vector_quickSortCustomCompare(this->rows, compareRowByKnownParentThenNatural);
+
+   // Find all processes whose parent is not visible
+   for (int i = 0; i < vsize; i++) {
+      Row* row = (Row*)Vector_get(this->rows, i);
+
+      // If parent not found, then construct the tree with this node as root
+      if (row->isRoot) {
+         row = (Row*)Vector_get(this->rows, i);
+         row->indent = 0;
+         row->tree_depth = 0;
+         Vector_add(this->displayList, row);
+         Table_buildTreeBranch(this, row->id, 0, 0, row->showChildren);
+         continue;
+      }
+   }
+
+   this->needsSort = false;
+
+   // Check consistency of the built structures
+   assert(Vector_size(this->displayList) == vsize); (void)vsize;
+}
+
+void Table_updateDisplayList(Table* this) {
+   const Settings* settings = this->host->settings;
+
+   if (settings->ss->treeView) {
+      if (this->needsSort)
+         Table_buildTree(this);
+   } else {
+      if (this->needsSort)
+         Vector_insertionSort(this->rows);
+      Vector_prune(this->displayList);
+      int size = Vector_size(this->rows);
+      for (int i = 0; i < size; i++)
+         Vector_add(this->displayList, Vector_get(this->rows, i));
+   }
+   this->needsSort = false;
+}
+
+void Table_expandTree(Table* this) {
+   int size = Vector_size(this->rows);
+   for (int i = 0; i < size; i++) {
+      Row* row = (Row*) Vector_get(this->rows, i);
+      row->showChildren = true;
+   }
+}
+
+// Called on collapse-all toggle and on startup, possibly in non-tree mode
+void Table_collapseAllBranches(Table* this) {
+   Table_buildTree(this); // Update `tree_depth` fields of the rows
+   this->needsSort = true; // Table is sorted by parent now, force new sort
+   int size = Vector_size(this->rows);
+   for (int i = 0; i < size; i++) {
+      Row* row = (Row*) Vector_get(this->rows, i);
+      // FreeBSD has pid 0 = kernel and pid 1 = init, so init has tree_depth = 1
+      if (row->tree_depth > 0 && row->id > 1)
+         row->showChildren = false;
+   }
+}
+
+void Table_rebuildPanel(Table* this) {
+   Table_updateDisplayList(this);
+
+   const Settings* settings = this->host->settings;
+   const ScreenSettings* ss = settings->ss;
+   const bool stableMode = ss->treeView && ss->stableTreeView > 0;
+   const bool hardMode = ss->treeView && ss->stableTreeView == 2;
+
+   const int currPos = Panel_getSelectedIndex(this->panel);
+   const int currScrollV = this->panel->scrollV;
+   const int currSize = Panel_size(this->panel);
+
+   /* Stable tree view: the anchor is active when stableId is set, following
+    * is not in use, and the cursor has not moved since the last rebuild. */
+   const int stableOffset = currPos - currScrollV;
+   const bool stableActive = stableMode
+      && (this->following == -1)
+      && (this->stableId != -1)
+      && (currPos == this->stableLastIdx);
+
+   Panel_prune(this->panel);
+
+   /* Follow main group row instead if following a row that is occluded (hidden) */
+   if (this->following != -1) {
+      const Row* followed = (const Row*) Hashtable_get(this->table, this->following);
+      if (followed != NULL
+         && Hashtable_get(this->table, followed->group)
+         && Row_isVisible(followed, this) == false ) {
+         this->following = followed->group;
+      }
+   }
+
+   /* One-shot: keep the selection on the currently shown process when a
+    * visibility toggle (H/K/O) just happened, redirecting to the process a
+    * now-hidden row belongs to. If no visible target remains, fall back to
+    * anchoring the nearest surviving row below. Ignored while following. */
+   int wantId = this->pendingSelection;
+   int pendingSel = -1;
+   bool pendingFallback = false;
+   if (this->following == -1 && wantId != -1) {
+      const Row* pending = (const Row*) Hashtable_get(this->table, wantId);
+      if (pending != NULL) {
+         if (pending->show) {
+            pendingSel = wantId;
+         } else {
+            int parentId = Row_getGroupOrParent(pending);
+            const Row* redirect = (const Row*) Hashtable_get(this->table, parentId);
+            if (parentId != wantId
+               && redirect != NULL && redirect->show
+               && !Row_matchesFilter(redirect, this)) {
+               pendingSel = parentId;
+            } else {
+               pendingFallback = true;
+            }
+         }
+      }
+   }
+   this->pendingSelection = -1;
+
+   const int rowCount = Vector_size(this->displayList);
+   bool foundFollowed = false;
+   bool foundPendingSelection = false;
+   bool fallbackNext = false;
+   int fallbackIdx = -1;
+   int stableFoundIdx = -1;
+   int idx = 0;
+
+   for (int i = 0; i < rowCount; i++) {
+      Row* row = (Row*) Vector_get(this->displayList, i);
+
+      if (pendingFallback && row->id == wantId) {
+         /* The wanted row is hidden; anchor the next surviving row instead */
+         pendingFallback = false;
+         fallbackNext = true;
+      }
+
+      if ( !row->show || (Row_matchesFilter(row, this) == true) )
+         continue;
+
+      Panel_set(this->panel, idx, (Object*)row);
+
+      if (fallbackNext) {
+         fallbackNext = false;
+         fallbackIdx = idx;
+      }
+
+      if (this->following != -1 && row->id == this->following) {
+         foundFollowed = true;
+         Panel_setSelected(this->panel, idx);
+         /* Keep scroll position relative to followed row.
+            Allow negative scrollV in hard mode so that blank lines
+            above row 0 can appear (keeping the followed row at its
+            visual offset), but clip to 0 in soft mode or when the
+            followed row is at index 0 (nothing above it to scroll
+            off). */
+         int newScrollV = idx - (currPos - currScrollV);
+         if (!hardMode || idx == 0) {
+            if (newScrollV < 0)
+               newScrollV = 0;
+         }
+         this->panel->scrollV = newScrollV;
+         this->panel->allowExcessScrollV = true;
+      }
+
+      if (pendingSel != -1 && row->id == pendingSel) {
+         foundPendingSelection = true;
+         Panel_setSelected(this->panel, idx);
+         /* Keep scroll position relative to the selected row */
+         int newScrollV = idx - stableOffset;
+         if (!hardMode || idx == 0) {
+            if (newScrollV < 0)
+               newScrollV = 0;
+         }
+         this->panel->scrollV = newScrollV;
+         this->panel->allowExcessScrollV = true;
+      }
+
+      if (stableActive && row->id == this->stableId) {
+         stableFoundIdx = idx;
+      }
+
+      idx++;
+   }
+
+   if (this->following != -1 && !foundFollowed) {
+      /* Reset if current followed row not found */
+      this->following = -1;
+      Panel_setSelectionColor(this->panel, PANEL_SELECTION_FOCUS);
+   }
+
+   if (fallbackIdx == -1 && fallbackNext && idx > 0)
+      fallbackIdx = idx - 1; /* hidden row was last; anchor the new last row */
+
+   if (this->following == -1) {
+      if (fallbackIdx != -1) {
+         /* No visible target for the pending selection: anchor the nearest
+            surviving row at the same screen position */
+         Panel_setSelected(this->panel, fallbackIdx);
+         int newScrollV = fallbackIdx - stableOffset;
+         if (newScrollV < 0)
+            newScrollV = 0;
+         this->panel->scrollV = newScrollV;
+         this->panel->allowExcessScrollV = true;
+      } else if (!foundPendingSelection && stableActive && stableFoundIdx != -1) {
+         /* Stable tree view: keep the anchor row at the same screen line.
+            In hard mode, scrollV may go negative to render empty lines above row 0,
+            but only when the root is not selected (reset to 0 when root is at the top).
+            In soft mode, scrollV is clamped to 0 so no empty space appears above.
+            In both modes, scrollV may exceed size-h (empty lines below the last row)
+            so that processes above the anchor can be scrolled off the top of the
+            viewport rather than pushing the anchor down. */
+         Panel_setSelected(this->panel, stableFoundIdx);
+         int newScrollV = stableFoundIdx - stableOffset;
+         if (!hardMode || stableFoundIdx == 0) {
+            /* soft mode: no empty lines above row 0;
+             * hard mode + root selected: reset to top of panel */
+            if (newScrollV < 0)
+               newScrollV = 0;
+         }
+         this->panel->scrollV = newScrollV;
+         this->panel->allowExcessScrollV = true;
+         this->stableLastIdx = stableFoundIdx;
+      } else if (!foundPendingSelection) {
+         /* Normal behavior: restore position by index */
+         if (currPos > 0 && currPos == currSize - 1)
+            Panel_setSelected(this->panel, Panel_size(this->panel) - 1);
+         else
+            Panel_setSelected(this->panel, currPos);
+
+         this->panel->scrollV = currScrollV;
+         this->panel->allowExcessScrollV = false;
+      }
+
+      /* Update stable anchor from the newly selected row */
+      if (stableMode) {
+         const Row* sel = (const Row*) Panel_getSelected(this->panel);
+         if (sel) {
+            this->stableId = sel->id;
+            this->stableLastIdx = Panel_getSelectedIndex(this->panel);
+         } else {
+            this->stableId = -1;
+         }
+      } else {
+         this->stableId = -1;
+      }
+   }
+}
+
+void Table_printHeader(const Settings* settings, RichString* header) {
+   RichString_rewind(header, RichString_size(header));
+
+   const ScreenSettings* ss = settings->ss;
+   const RowField* fields = ss->fields;
+
+   RowField key = ScreenSettings_getActiveSortKey(ss);
+   int pinnedCount = RowField_pinnedCount(settings);
+
+   for (int i = 0; fields[i]; i++) {
+      int color;
+      bool isPinned = (i < pinnedCount);
+      if (isPinned) {
+         color = CRT_colors[PANEL_HEADER_PINNED];
+      } else if (ss->treeView && ss->treeViewAlwaysByPID) {
+         color = CRT_colors[PANEL_HEADER_FOCUS];
+      } else if (key == fields[i]) {
+         color = CRT_colors[PANEL_SELECTION_FOCUS];
+      } else {
+         color = CRT_colors[PANEL_HEADER_FOCUS];
+      }
+
+      RichString_appendWide(header, color, RowField_alignedTitle(settings, fields[i]));
+      if (key == fields[i] && RichString_getCharVal(*header, RichString_size(header) - 1) == ' ') {
+         bool ascending = ScreenSettings_getActiveDirection(ss) == 1;
+         RichString_rewind(header, 1);  // rewind to override space
+         RichString_appendWide(header,
+                                CRT_colors[PANEL_SELECTION_FOCUS],
+                                CRT_treeStr[ascending ? TREE_STR_ASC : TREE_STR_DESC]);
+      }
+      if (COMM == fields[i] && settings->showMergedCommand) {
+         RichString_appendAscii(header, color, "(merged)");
+      }
+   }
+}
+
+// set flags on an existing rows before refreshing table
+void Table_prepareEntries(Table* this) {
+   for (int i = 0; i < Vector_size(this->rows); i++) {
+      Row* row = (struct Row_*) Vector_get(this->rows, i);
+      row->updated = false;
+      row->wasShown = row->show;
+      row->show = true;
+   }
+}
+
+// tidy up Row state after refreshing the table
+Row* Table_cleanupRow(Table* table, Row* row, int idx) {
+   Machine* host = table->host;
+   const Settings* settings = host->settings;
+
+   if (row->tombStampMs > 0) {
+      // remove tombed process
+      if (host->monotonicMs >= row->tombStampMs) {
+         goto remove;
+      }
+   } else if (!row->updated) {
+      // process no longer exists
+      if (settings->highlightChanges && row->wasShown) {
+         // mark tombed
+         row->tombStampMs = host->monotonicMs + 1000 * settings->highlightDelaySecs;
+      } else {
+         // immediately remove
+         goto remove;
+      }
+   }
+   return row;
+
+remove:
+   Table_removeIndex(table, row, idx);
+   return NULL;
+}
+
+void Table_cleanupEntries(Table* this) {
+   // Lowest index of the row that is soft-removed. Used to speed up
+   // compaction.
+   int dirtyIndex = Vector_size(this->rows);
+
+   // Finish process table update, culling any removed rows
+   for (int i = Vector_size(this->rows) - 1; i >= 0; i--) {
+      Row* row = (Row*) Vector_get(this->rows, i);
+      if (!Table_cleanupRow(this, row, i)) {
+         dirtyIndex = i;
+      }
+   }
+
+   // compact the table in case of any earlier row removals
+   Table_compact(this, dirtyIndex);
+}
+
+const TableClass Table_class = {
+   .super = {
+      .extends = Class(Object),
+      .delete = Table_delete,
+   },
+   .prepare = Table_prepareEntries,
+   .cleanup = Table_cleanupEntries,
+};

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Keep htop_plus's layout in the source directory, independently of system htop.
+set -eu
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ ! -x "$project_dir/htop" ]; then
+   echo 'Build first: ./autogen.sh && CC=/usr/bin/gcc ./configure && make -j8' >&2
+   exit 1
+fi
+if [ -z "${HTOPRC:-}" ]; then
+   if [ ! -e "$project_dir/htoprc" ]; then
+      cp "$project_dir/htoprc.example" "$project_dir/htoprc"
+   fi
+   HTOPRC="$project_dir/htoprc"
+   export HTOPRC
+fi
+exec "$project_dir/htop" "$@"
