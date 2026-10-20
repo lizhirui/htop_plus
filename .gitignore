@@ -1,5 +1,6 @@
 # the binaries:
 htop
+/htop_plus
 pcp-htop
 /htoprc
 /tests/build/

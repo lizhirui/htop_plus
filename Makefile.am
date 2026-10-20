@@ -1,6 +1,6 @@
 if !HTOP_PCP
-bin_PROGRAMS = htop
-myhtopplatprogram = htop.c
+bin_PROGRAMS = htop_plus
+myhtopplatprogram = HtopPlus.c
 else
 bin_PROGRAMS = pcp-htop
 myhtopplatprogram = pcp-htop.c
@@ -10,7 +10,6 @@ dist_man_MANS = htop.1
 EXTRA_DIST = \
 	$(dist_man_MANS) \
 	autogen.sh \
-	htop_plus \
 	htoprc.example \
 	install.sh \
 	uninstall.sh \
@@ -195,7 +194,6 @@ linux_platform_headers = \
 	generic/hostname.h \
 	generic/uname.h \
 	linux/CGroupUtils.h \
-	linux/CableConfig.h \
 	linux/Compat.h \
 	linux/DockerUsers.h \
 	linux/GPU.h \
@@ -229,7 +227,6 @@ linux_platform_sources = \
 	generic/hostname.c \
 	generic/uname.c \
 	linux/CGroupUtils.c \
-	linux/CableConfig.c \
 	linux/Compat.c \
 	linux/DockerUsers.c \
 	linux/GPU.c \
@@ -527,11 +524,13 @@ endif
 
 # ----
 
-htop_SOURCES = $(myhtopplatprogram) $(myhtopheaders) $(myhtopplatheaders) $(myhtopsources) $(myhtopplatsources)
-nodist_htop_SOURCES = config.h
+if !HTOP_PCP
+htop_plus_SOURCES = $(myhtopplatprogram) $(myhtopheaders) $(myhtopplatheaders) $(myhtopsources) $(myhtopplatsources)
+nodist_htop_plus_SOURCES = config.h
+endif
 
 target:
-	echo $(htop_SOURCES)
+	echo $(myhtopplatprogram) $(myhtopsources) $(myhtopplatsources)
 
 profile:
 	$(MAKE) all AM_CPPFLAGS="-pg -O2 -DNDEBUG"

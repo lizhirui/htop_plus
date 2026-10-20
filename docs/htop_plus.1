@@ -15,6 +15,12 @@ total cable power on a 1000W display scale, connector temperature (Con),
 and controller temperature (Ctl).
 The 1000W scale does not measure total PSU power or configure hardware limits.
 .PP
+Cable readings come from the nvpowermon 2.0.1 service over a read-only
+Unix socket subscription. Multiple monitoring clients can run concurrently.
+Only the service accesses the serial device and reads its configuration.
+Disconnected, invalid or stale readings show N/A; reconnection is retried
+every five seconds. Samples expire ten seconds after the service query.
+.PP
 Press F2 to configure meters and columns; press F10 or q to quit.
 Run htop_plus --help for the full list of supported htop command-line options.
 .SH OPTIONS
@@ -23,7 +29,7 @@ Run htop_plus --help for the full list of supported htop command-line options.
 Disable process-changing operations.
 .TP
 .B --version
-Display the underlying htop version.
+Display the htop_plus name and underlying htop version.
 .TP
 .B --help
 Display all supported command-line options.
@@ -37,13 +43,16 @@ User configuration directory, defaulting to $HOME/.config.
 Installed htop_plus creates htop_plus/htoprc here on first run.
 Existing layouts are preserved during startup and upgrades.
 .TP
-.B HTOP_POWER_CABLE_CONFIG
-Select another connection configuration instead of /etc/nvpowermon/config.json.
-The USB serial number and optional VID/PID identify the current serial port.
+.B HTOP_POWER_CABLE_SOCKET
+Override /run/nvpowermon/status.sock, or set to off to disable cable readings.
+The path must be absolute.
+.TP
+.B NVPOWERMON_SOCKET
+Shared socket override, used when HTOP_POWER_CABLE_SOCKET is unset or empty.
 .TP
 .B HTOP_POWER_CABLE_PORT
-Override the configured connection with an absolute /dev/ path, or set
-to off to disable cable queries.
+The legacy value off still disables readings. Other port overrides and
+HTOP_POWER_CABLE_CONFIG are retired; configure the nvpowermon service instead.
 .TP
 .B DOCKER_HOST
 Select a local Docker socket using unix:///path/to/docker.sock.
@@ -53,10 +62,18 @@ Select a local Docker socket using unix:///path/to/docker.sock.
 Per-user meter layout, independent of the original htop configuration.
 .TP
 .I /etc/nvpowermon/config.json
-Existing read-only intelligent cable connection settings.
+Device connection settings read by the nvpowermon service, not this client.
+.TP
+.I /run/nvpowermon/status.sock
+Default nvpowermon subscription socket (protocol v1).
 .SH NOTES
-The installer uses /usr/local by default and keeps the modified htop binary
-under libexec/htop_plus. It does not replace the system htop executable.
-The source checkout launcher keeps its layout in the source directory.
+The installer places the native executable at /usr/local/bin/htop_plus
+by default. The process name and executable basename are both htop_plus.
+It does not replace the system htop executable.
+Upgrades remove the previous libexec/htop_plus/htop executable.
+The source checkout binary keeps its layout in the source directory.
+Install nvpowermon separately and register its service with
+sudo nvpowermon --register. For an existing service, use
+sudo nvpowermon --start and nvpowermon --status.
 .SH LICENSE
 GNU GPL version 2 or, at your option, any later version.

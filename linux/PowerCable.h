@@ -19,7 +19,7 @@ typedef struct PowerCableReading_ {
    char message[160];
 } PowerCableReading;
 
-/* These functions never wait for serial I/O. Call get on each screen refresh. */
+/* Nonblocking nvpowermon subscription. Call get on each screen refresh. */
 const PowerCableReading* PowerCable_get(void);
 void PowerCable_done(void);
 

@@ -3,7 +3,7 @@
 源码来自 [htop 官方仓库](https://github.com/htop-dev/htop)。
 下载时间为 2026-10-18，上游版本为 `3.6.0-dev`，提交为 `05c0af5ef82bd4729ab1a22666413689a04bfc2d`。
 原版代码与新增 C 模块均采用 GPL-2.0-or-later，见根目录 `COPYING`。
-串口协议参考 `~/workspace/12V-2X6Ti开源` 中的设备说明、固件通信格式与实际采样，没有复制该目录的 GPL-3.0-only Python 实现。
+电源线数据接口对齐 `~/workspace/12V-2X6Ti开源` 的 nvpowermon 2.0.1（提交 `7afb11c`）及其 socket 协议 v1。该项目现采用 MIT；本仓库独立实现 C 订阅客户端，整体许可证保持 GPL-2.0-or-later。
 
 ## 启动
 
@@ -13,15 +13,14 @@ cd ~/workspace/htop_plus
 ```
 
 已在本机编译完成，无需安装即可使用。
-启动器首次运行会将 `htoprc.example` 复制成当前目录的 `htoprc`，之后保留你的修改。
+程序首次运行会将 `htoprc.example` 复制成当前目录的 `htoprc`，之后保留你的修改。
 两栏顶部恢复每核 CPU 条，本机 0～95 号逻辑 CPU 全部显示。
 左右栏各显示一半核心，每栏分成四个小列；GPU 在左侧 CPU/内存下方，电源线在右侧 CPU/任务信息下方。
 在 F2 → Meters 中可添加每核 CPU、移动或删除仪表；新的两个仪表名为 `NVIDIA GPU sensors` 和 `5090 12V-2X6 Ti cable`。
 F10 或 q 退出。
 
-直接运行 `./htop` 也支持新仪表，但读取原有 htop 配置；原配置没有新仪表时，可通过 F2 添加。
-没有原配置时，Linux 默认布局会在左右栏各追加 GPU 和电源线仪表。
-启动器支持 htop 原有参数，例如 `./htop_plus --readonly`。
+在 F2 中可以添加、移除新仪表。
+程序支持 htop 原有参数，例如 `./htop_plus --readonly`。
 可通过 `HTOPRC=/path/to/htoprc ./htop_plus` 使用其他配置。
 建议使用 120 列、32 行及以上终端，以便完整显示 96 个核心的百分比和进程列表。
 终端较窄时每核条内的文字会截断；可在 F2 调整 CPU 小列数量和布局。
@@ -39,8 +38,7 @@ man htop_plus
 
 | 文件 | 默认安装位置 |
 | --- | --- |
-| 启动命令 | `/usr/local/bin/htop_plus` |
-| 修改版 htop 本体 | `/usr/local/libexec/htop_plus/htop` |
+| 原生可执行程序 | `/usr/local/bin/htop_plus` |
 | 默认界面模板 | `/usr/local/share/htop_plus/htoprc.example` |
 | 文档与许可证 | `/usr/local/share/doc/htop_plus/` |
 | man 手册 | `/usr/local/share/man/man1/htop_plus.1` |
@@ -48,7 +46,9 @@ man htop_plus
 安装版在首次运行时创建 `${XDG_CONFIG_HOME:-$HOME/.config}/htop_plus/htoprc`，保存每个用户自己的布局。
 不会覆盖原版 `htop`、已有个人布局或 `/etc/nvpowermon/config.json`。
 更新时重新运行安装脚本，已运行的旧版进程可继续运行；重新启动命令后使用新版。
-源码目录里的 `./htop_plus` 仍使用源码目录的 `htoprc`。
+源码目录里的 `./htop_plus` 使用源码目录的 `htoprc`。
+编译产物与安装文件均为名为 `htop_plus` 的原生程序，进程名、命令行和可执行文件路径保持一致。
+升级会清理旧版 `/usr/local/libexec/htop_plus/htop`，不再使用启动脚本。
 `HTOPRC` 可以显式指定其他布局文件。
 
 ```sh
@@ -130,38 +130,47 @@ Linux 上的 USER 列会显示 Docker 容器名和容器内用户名，例如 `[
 各路功率由返回的电压、电流相乘，可能因设备内部计算和四舍五入而与设备总功率不完全相等。
 NVML 的整卡功率与外接线功率测量范围不同，分别显示。
 
-默认读取 `/etc/nvpowermon/config.json`，与原来的 nvpowermon 共用同一份连接配置。
-有 `usb_serial` 时，在 `/sys/class/tty` 中枚举 USB 串口，沿设备父目录读取序列号、VID/PID，只选择唯一匹配的设备。
-此时忽略配置中的旧 `port`，因此插拔后变成 `ttyACM1` 仍能定位；无匹配或匹配多个设备时报错，不回退到其他端口。
-`usb_serial` 为 null 或省略时才使用 `port`；如果同时设置了 VID/PID，也会验证指定端口的 USB 信息。
-本机配置的序列号是 `5CF9119752`，VID/PID 是 `1a86:55d3`。
-同样读取 `baudrate` 和 `timeout_seconds`；波特率只接受 115200，超时必须是有限正数。
-配置只读，每次重新连接时重新读取，不修改 `/etc/nvpowermon`。
+数据由 **nvpowermon 2.0.1 服务**采集，htop_plus 默认订阅 `/run/nvpowermon/status.sock`。
+htop_plus 与 `nvpowermon --watch`、`nvpowermon -t` 等客户端可以同时运行，共享同一份采样。
+只有服务打开串口，采样频率由服务决定，增加客户端不会增加串口查询次数。
+
+设备配置仍为 `/etc/nvpowermon/config.json`，由 nvpowermon 服务读取。
+服务根据配置里的 USB 序列号及 VID/PID 定位串口；设备重新插拔导致串口编号变化时，由服务重新定位。
+htop_plus 不再读取设备配置或访问串口，也不会在服务不可用时回退为串口直连。
+客户端只需 socket 访问权限，无需串口权限。
 
 ```sh
-./htop_plus  # 默认使用 /etc/nvpowermon/config.json
+# 已安装 nvpowermon，但尚未注册服务时（在上游项目中先执行其 install.sh）
+sudo nvpowermon --register
 
-# 临时指定另一份同格式配置
-HTOP_POWER_CABLE_CONFIG=/path/to/config.json ./htop_plus
+# 已注册的服务可用以下命令检查、启动
+nvpowermon --status
+sudo nvpowermon --start
 
-# 显式端口覆盖：绕过配置定位，适合调试
-HTOP_POWER_CABLE_PORT=/dev/ttyACM0 ./htop_plus
+./htop_plus
 
-# 关闭串口采集
-HTOP_POWER_CABLE_PORT=off ./htop_plus
+# 临时订阅另一个 nvpowermon 服务
+HTOP_POWER_CABLE_SOCKET=/path/to/status.sock ./htop_plus
+
+# 也兼容 nvpowermon 自身的环境变量；HTOP_POWER_CABLE_SOCKET 优先
+NVPOWERMON_SOCKET=/path/to/status.sock ./htop_plus
+
+# 关闭电源线订阅
+HTOP_POWER_CABLE_SOCKET=off ./htop_plus
 ```
 
-使用 115200、8N1、无流控；独占串口并检查可见的已有读取进程。
-同一时间请只运行一个串口监控程序；`nvpowermon -t`、WINGFORCE 等已占用设备时会显示 busy。
-只发送 `*IDN?` 和 `SENSORDATA?`，先验证型号，不发送配置、风扇控制、复位、报警测试或保护控制命令。
-程序不主动切换 DTR/RTS、不发送 BREAK，清除 HUPCL 以避免关闭时请求拉低控制线；内核首次打开设备仍可能设置默认控制线状态。
-使用非阻塞状态机，不等待串口应答；查询超时读取配置的 `timeout_seconds`，省略时为 4 秒，下次界面刷新时处理超时。
-显式设置 `HTOP_POWER_CABLE_PORT` 覆盖时使用 4 秒超时。
-每次成功响应后至少隔 2 秒再查询，设备自身缓存约 2 秒更新一次。
-每 5 秒重试无法连接的设备，重连时重新验证 ID。
-超时、非法响应或检测到拔线时立即清除有效标志，面板改为 `N/A`，不会继续把旧读数显示为当前值。
-采样超过 10 秒未更新也会失效。
-协议未返回报警状态、传感器有效标志或设备采样时间戳，因此这里展示的是设备报告的缓存读数。
+保留旧的 `HTOP_POWER_CABLE_PORT=off` 禁用方式；其他端口覆盖及 `HTOP_POWER_CABLE_CONFIG` 已停用，设置后会显示迁移提示。
+需要更换设备或配置文件时，应修改 nvpowermon 服务配置。
+htop_plus 的安装脚本只安装本工具；nvpowermon 服务由其自身项目管理。
+
+订阅使用非阻塞 Unix socket，接收 UTF-8 JSON Lines，不发送请求、串口命令或控制指令。
+支持分段、多帧合并和协议允许的最长 65536 字节帧，忽略未知扩展字段。
+检查协议版本、元数据、六路有序通道及全部必需数值；拒绝非有限数值、错误类型和非法帧。
+同一连接上忽略重复及旧序号，重连后重新计数，以适应服务重启。
+服务的 `starting`、`error` 状态和连接中断会立即使面板显示 `N/A`；服务错误原因显示在标题下方。
+断线每 5 秒尝试重连，首次等待超时 15 秒，后续推送超时 10 秒。
+按服务提供的 `sample_monotonic_s` 与本机单调时钟检查 10 秒有效期，收到旧缓存和持续连接停止更新时均会失效。
+这个时间戳表示服务发起查询的时间；硬件自身缓存约每 2 秒更新一次。
 
 ## 编译与验证
 
@@ -177,19 +186,18 @@ python3 tests/test_install.py
 需要 C 编译器、make、autoconf、automake、pkg-config，以及 ncurses、json-c 和 libcurl 开发包（Debian/Ubuntu 对应 `libncurses-dev libjson-c-dev libcurl4-openssl-dev`）。
 使用 `/usr/bin/gcc` 可避开本机环境中的 ccache 缓存目录权限问题。
 本次构建关闭了可选的 sensors 和 capabilities；NVML 和智能线采集不依赖它们。
-自动测试使用伪终端与模拟 NVML，不接触真实 GPU 和串口。
-测试也覆盖配置文件解析、按 USB 序列号与 VID/PID 定位、串口改号、不匹配时不回退和重复序列号。
-测试覆盖多 GPU、单位换算、RPM ABI、单项不支持、驱动初始化失败、分段串口响应、错误 ID、非法字段、超长响应、超时、占用和断线。
+自动测试使用模拟 NVML 和 Unix socket 服务，不接触真实 GPU 和串口。
+测试覆盖多 GPU、单位换算、RPM ABI、单项不支持、驱动初始化失败，以及分段/合并 JSON 帧、长度上限、非法字段、协议版本、启动/错误/恢复、缓存过期、超时、断线重连和序号重置。
 
 测试后可用诊断程序检查真实采集：
 
 ```sh
 tests/build/hardware-probe 1           # 一次 GPU 查询
-tests/build/hardware-probe 100 cable   # 约五秒串口采集
+tests/build/hardware-probe 100 cable   # 约五秒服务订阅
 scripts/verify-hardware-ui.sh         # 用 tmux 检查 180、120、80 列终端
 ```
 
 终端检查输出保存在 `tests/build/ui-180.txt`、`ui-120.txt` 和 `ui-80.txt`。
-检查脚本会临时独占智能线，退出后关闭测试终端。
+检查脚本订阅已有 nvpowermon 服务，退出后关闭测试终端。
 
 Docker 自动测试使用模拟 Unix HTTP 服务，不访问真实 Docker；真机界面检查可运行 `scripts/verify-docker-users.sh`，结果保存在 `tests/build/ui-docker-users.txt`。

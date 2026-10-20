@@ -11,7 +11,7 @@ esac
 socket="$project_dir/tests/build/docker-ui-verify.sock"
 cleanup() { tmux -S "$socket" kill-server 2>/dev/null || :; }
 trap cleanup EXIT INT TERM
-tmux -S "$socket" new-session -d -s verify -x 180 -y 45 "env HTOP_POWER_CABLE_PORT=off ./htop_plus --readonly --pid=$pid"
+tmux -S "$socket" new-session -d -s verify -x 180 -y 45 "env HTOP_POWER_CABLE_SOCKET=off ./htop_plus --readonly --pid=$pid"
 sleep 3
 tmux -S "$socket" capture-pane -p -t verify:0.0 > tests/build/ui-docker-users.txt
 python3 - <<'PY'

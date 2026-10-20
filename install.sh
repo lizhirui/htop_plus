@@ -9,7 +9,7 @@ build=yes
 usage() {
    echo 'Usage: ./install.sh [--prefix PATH] [--no-build]'
    echo 'Defaults: PREFIX=/usr/local; optional DESTDIR for staged installations.'
-   echo 'Builds when needed, then installs htop_plus, its private binary, defaults, docs and man page.'
+   echo 'Builds when needed, then installs the native htop_plus binary, defaults, docs and man page.'
 }
 
 while [ "$#" -gt 0 ]; do
@@ -37,8 +37,8 @@ if [ "$build" = yes ]; then
    fi
    make -s -C "$project_dir" -j "${JOBS:-8}"
 fi
-if [ ! -x "$project_dir/htop" ]; then
-   echo 'No htop binary found. Run ./install.sh without --no-build first.' >&2
+if [ ! -x "$project_dir/htop_plus" ]; then
+   echo 'No htop_plus binary found. Run ./install.sh without --no-build first.' >&2
    exit 1
 fi
 
@@ -50,7 +50,7 @@ for file in htop_plus htoprc.example COPYING docs/htop_plus.md docs/htop_plus.1 
    fi
 done
 
-install -d -m 0755 "$target/bin" "$target/libexec/htop_plus" \
+install -d -m 0755 "$target/bin" \
    "$target/share/htop_plus" "$target/share/doc/htop_plus" "$target/share/man/man1"
 temporary=
 trap '[ -z "$temporary" ] || rm -f -- "$temporary"' EXIT
@@ -64,7 +64,6 @@ install_file() {
    temporary=
 }
 
-install_file htop "$target/libexec/htop_plus/htop" 0755
 install_file htoprc.example "$target/share/htop_plus/htoprc.example" 0644
 install_file COPYING "$target/share/doc/htop_plus/COPYING" 0644
 install_file docs/htop_plus.md "$target/share/doc/htop_plus/README.md" 0644
@@ -72,7 +71,12 @@ install_file docs/htop_plus.1 "$target/share/man/man1/htop_plus.1" 0644
 install_file uninstall.sh "$target/share/htop_plus/uninstall.sh" 0755
 install_file htop_plus "$target/bin/htop_plus" 0755
 
+# Retire the previous wrapper's private executable after the new binary is in place.
+rm -f -- "$target/libexec/htop_plus/htop"
+rmdir -- "$target/libexec/htop_plus" 2>/dev/null || :
+
 echo "Installed: $target/bin/htop_plus"
 echo 'Run: htop_plus'
 echo 'Layout: ${XDG_CONFIG_HOME:-$HOME/.config}/htop_plus/htoprc (created on first run)'
-echo 'Cable configuration: /etc/nvpowermon/config.json'
+echo 'Cable data: nvpowermon service at /run/nvpowermon/status.sock'
+echo 'Device configuration: /etc/nvpowermon/config.json (read by nvpowermon)'

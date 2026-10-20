@@ -675,17 +675,19 @@ computed per-channel watts, reported total watts, connector temperature (Con),
 and controller temperature (Ctl).
 Current bars use a fixed 10A scale, total power 1000W, and temperature 100C;
 these are display scales, not hardware protection settings.
-Set
-.B HTOP_POWER_CABLE_PORT
-to an absolute /dev/ serial path, or to "off" to disable collection.
-By default, /etc/nvpowermon/config.json is read and the USB serial number,
-vendor ID and product ID are matched against sysfs to find the current port.
-With usb_serial set, no match or multiple matches are errors; the configured
-port is only used when usb_serial is null or absent.
-HTOP_POWER_CABLE_CONFIG may select a different JSON file.
-The configured baudrate must be 115200 and timeout_seconds is honored.
-Only device ID and sensor queries are sent, using nonblocking 115200 8N1 I/O.
-Disconnected, invalid or timed-out readings show N/A; reconnection is retried.
+Readings are subscribed from the nvpowermon 2.0.1 service through
+/run/nvpowermon/status.sock (protocol v1), using nonblocking I/O.
+Set HTOP_POWER_CABLE_SOCKET to another absolute socket path or "off" to disable.
+NVPOWERMON_SOCKET is used when HTOP_POWER_CABLE_SOCKET is unset or empty.
+The legacy HTOP_POWER_CABLE_PORT=off is also accepted; other serial overrides
+and HTOP_POWER_CABLE_CONFIG have been retired.
+Only the service reads /etc/nvpowermon/config.json and accesses the serial port.
+Multiple monitoring clients may subscribe concurrently without changing the
+service sampling frequency. No commands are sent by this client.
+Disconnected, invalid, service-error or stale readings show N/A.
+Samples expire ten seconds after the service query; reconnection is retried
+every five seconds. Register the service with sudo nvpowermon --register,
+or start an existing service with sudo nvpowermon --start.
 .SS "Standard meters"
 Header meters (configured in Setup, F2) show live host statistics. The
 .B CPU

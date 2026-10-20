@@ -1,32 +1,61 @@
 #!/usr/bin/env python3
-"""Integration tests: real C modules, fake NVML, and a simulated serial device."""
-import os
+"""Exercise real C collectors with fake NVML and nvpowermon socket peers."""
+from contextlib import ExitStack
 import json
+import os
 from pathlib import Path
-import pty
 import select
+import socket
 import subprocess
-import threading
 import tempfile
+import threading
 import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'tests' / 'build'
-SAMPLE = b'12.06,0.48,12.06,0.44,12.06,0.40,12.05,0.36,12.04,0.32,12.03,0.28,27.48,42.23,43.50\n'
 
 
 def build():
     BUILD.mkdir(exist_ok=True)
-    subprocess.run(['/usr/bin/gcc', '-std=c99', '-D_DEFAULT_SOURCE', '-I.', '-Ilinux',
-                    'tests/HardwareProbe.c', 'linux/NvidiaTelemetry.c',
-                    'linux/PowerCable.c', 'linux/CableConfig.c', 'XUtils.c', '-ldl', '-lm', '-ljson-c',
+    subprocess.run(['/usr/bin/gcc', '-std=c99', '-D_DEFAULT_SOURCE', '-Wall', '-Wextra',
+                    '-I.', '-Ilinux', 'tests/HardwareProbe.c', 'linux/NvidiaTelemetry.c',
+                    'linux/PowerCable.c', 'XUtils.c', '-ldl', '-lm', '-ljson-c',
                     '-o', str(BUILD / 'hardware-probe')], cwd=ROOT, check=True)
     subprocess.run(['/usr/bin/gcc', '-shared', '-fPIC', 'tests/FakeNvml.c',
                     '-o', str(BUILD / 'libnvidia-ml.so.1')], cwd=ROOT, check=True)
-    subprocess.run(['/usr/bin/gcc', '-std=c99', '-D_DEFAULT_SOURCE', '-I.', '-Ilinux',
-                    'tests/ConfigProbe.c', 'linux/CableConfig.c', 'XUtils.c', '-ljson-c',
-                    '-o', str(BUILD / 'config-probe')], cwd=ROOT, check=True)
+
+
+def snapshot(sequence=1, power=27.48, age=0):
+    return {
+        'schema_version': 1, 'sequence': sequence, 'time': '2026-10-20T12:00:00+08:00',
+        'state': 'ok', 'valid': True, 'sample_monotonic_s': time.monotonic() - age,
+        'device': {'port': '/dev/ttyACM7', 'usb_serial': 'example'},
+        'id': 'WINGSTUDIO 12V-2X6 Ti V1.0',
+        'status': {
+            'channels': [{'channel': chr(65 + i), 'voltage_v': v, 'current_a': a}
+                         for i, (v, a) in enumerate(((12.06, .48), (12.06, .44), (12.06, .40),
+                                                    (12.05, .36), (12.04, .32), (12.03, .28)))],
+            'total_power_w': power, 'cable_temperature_c': 42.23, 'board_temperature_c': 43.5,
+        },
+        'device_config': dict(zip((
+            'screen_rotation', 'shunt_resistance_milliohm', 'current_correction_rate',
+            'fan_control_type', 'fan_on_temperature_c', 'alarm_temperature_c',
+            'alarm_current_per_channel_a', 'alarm_timeout_s', 'protection_current_per_channel_a',
+            'protection_temperature_c'), (1, 1.0, 1.0, 0, 45, 85, 12, 120, 15, 100))),
+        'error': None,
+    }
+
+
+def unavailable(state, sequence):
+    return dict(schema_version=1, sequence=sequence, state=state, valid=False,
+                time='2026-10-20T12:00:00+08:00', sample_monotonic_s=None,
+                device=None, id=None, status=None, device_config=None,
+                error='串口已断开' if state == 'error' else None)
+
+
+def frame(data):
+    return json.dumps(data, ensure_ascii=False).encode() + b'\n'
 
 
 class HardwareTests(unittest.TestCase):
@@ -48,192 +77,252 @@ class HardwareTests(unittest.TestCase):
                     env=dict(os.environ, LD_LIBRARY_PATH=str(BUILD), TEST_NVML_INIT_FAIL='1'), text=True)
         self.assertIn('gpus=0 message=NVIDIA driver initialization failed', result)
 
-    def cable(self, sample=SAMPLE, identity=b'WINGSTUDIO 12V-2X6 Ti V1.0\n\r\n',
-              silent=False, disconnect=False, config_timeout=None):
-        master, slave = pty.openpty()
-        port = os.ttyname(slave)
-        # The module refuses already-open serial devices, including this fd.
-        os.close(slave)
-        stop = threading.Event()
-        commands = []
+    def cable(self, exchange=None, loops=12, connections=1, variable='HTOP_POWER_CABLE_SOCKET',
+              clients=1):
+        """Run native subscribers; assert that none sends any byte to the service."""
+        with tempfile.TemporaryDirectory(prefix='htop-cable-') as directory:
+            path = str(Path(directory) / 'status.sock')
+            stop = threading.Event()
+            errors = []
+            received = []
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(path)
+                server.listen(8)
+                server.settimeout(.1)
 
-        def device():
-            buffered = b''
-            while not stop.is_set():
-                if not select.select([master], [], [], 0.02)[0]:
-                    continue
+                def peer():
+                    try:
+                        with ExitStack() as peers:
+                            active = []
+                            for number in range(connections):
+                                while not stop.is_set():
+                                    try:
+                                        client, _ = server.accept()
+                                        break
+                                    except socket.timeout:
+                                        continue
+                                else:
+                                    return
+                                peers.enter_context(client)
+                                active.append(client)
+                                if exchange is None:
+                                    client.sendall(frame(snapshot()))
+                                else:
+                                    exchange(client, number)
+                                if number + 1 < connections and clients == 1:
+                                    # Simulate service restart, leaving the listener up.
+                                    client.close()
+                                    active.remove(client)
+                            while active and not stop.is_set():
+                                for client in select.select(active, [], [], .05)[0]:
+                                    data = client.recv(1024)
+                                    if not data:
+                                        active.remove(client)
+                                    else:
+                                        received.append(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass  # A malformed frame must cause the subscriber to close.
+                    except Exception as error:
+                        errors.append(error)
+
+                worker = threading.Thread(target=peer, daemon=True)
+                worker.start()
+                environment = dict(os.environ)
+                for key in ('HTOP_POWER_CABLE_PORT', 'HTOP_POWER_CABLE_CONFIG',
+                            'HTOP_POWER_CABLE_SOCKET', 'NVPOWERMON_SOCKET'):
+                    environment.pop(key, None)
+                environment[variable] = path
+                processes = []
+                started = time.monotonic()
                 try:
-                    data = os.read(master, 1024)
-                except OSError:
-                    time.sleep(0.01)
-                    continue
-                buffered += data
-                while b'\n' in buffered:
-                    command, buffered = buffered.split(b'\n', 1)
-                    commands.append(command)
-                    if silent:
-                        continue
-                    if command == b'*IDN?':
-                        response = identity
-                    elif command == b'SENSORDATA?':
-                        response = sample
-                    else:
-                        return
-                    # Exercise responses split across separate UI refreshes.
-                    os.write(master, response[:7])
-                    time.sleep(0.08)
-                    os.write(master, response[7:])
-                    if disconnect and command == b'SENSORDATA?':
-                        time.sleep(0.2)
-                        os.close(master)
-                        return
+                    for _ in range(clients):
+                        processes.append(subprocess.Popen(
+                            [str(BUILD / 'hardware-probe'), str(loops), 'cable'],
+                            env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                    outputs = []
+                    for process in processes:
+                        output, error = process.communicate(timeout=loops * .05 + 4)
+                        self.assertEqual(process.returncode, 0, error)
+                        outputs.append(output)
+                finally:
+                    stop.set()
+                    for process in processes:
+                        if process.poll() is None:
+                            process.kill()
+                            process.communicate()
+                    worker.join(timeout=2)
+                self.assertFalse(worker.is_alive(), 'mock service did not stop')
+                self.assertFalse(errors, errors)
+                self.assertEqual(received, [], 'subscriber sent commands')
+                self.assertLess(time.monotonic() - started, loops * .05 + 3)
+                return outputs if clients > 1 else outputs[0]
 
-        worker = threading.Thread(target=device, daemon=True)
-        worker.start()
-        start = time.monotonic()
-        environment = dict(os.environ, HTOP_POWER_CABLE_PORT=port)
-        temporary = tempfile.TemporaryDirectory()
-        if config_timeout is not None:
-            path = Path(temporary.name) / 'config.json'
-            path.write_text(json.dumps({'usb_serial': None, 'port': port,
-                                        'timeout_seconds': config_timeout, 'baudrate': 115200}))
-            environment.pop('HTOP_POWER_CABLE_PORT', None)
-            environment['HTOP_POWER_CABLE_CONFIG'] = str(path)
-        try:
-            result = subprocess.run([str(BUILD / 'hardware-probe'), '100' if silent else '30', 'cable'],
-                        env=environment, text=True,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=7, check=True)
-        finally:
-            stop.set()
-            worker.join(timeout=1)
-            if not disconnect:
-                os.close(master)
-            temporary.cleanup()
-        self.assertLess(time.monotonic() - start, 6)
-        self.assertTrue(all(c in (b'*IDN?', b'SENSORDATA?') for c in commands), commands)
-        return result.stdout, commands
-
-    def test_serial_fragmented_response_and_units(self):
-        result, commands = self.cable()
+    def test_fragmented_response_units_and_environment_fallback(self):
+        def exchange(client, _):
+            data = frame(snapshot())
+            client.sendall(data[:7])
+            time.sleep(.08)
+            client.sendall(data[7:])
+        result = self.cable(exchange, variable='NVPOWERMON_SOCKET')
         self.assertIn('valid=1 power=27.48 connector=42.23 controller=43.50', result)
         self.assertIn('channel A 12.06V 0.48A', result)
         self.assertIn('channel F 12.03V 0.28A', result)
-        self.assertEqual(commands, [b'*IDN?', b'SENSORDATA?'])
 
-    def test_wrong_identity_stops_sensor_queries(self):
-        result, commands = self.cable(identity=b'OTHER DEVICE\n')
-        self.assertIn('Cable: wrong device ID', result)
-        self.assertEqual(commands, [b'*IDN?'])
+    def test_coalesced_frames_and_unknown_fields(self):
+        def exchange(client, _):
+            data = snapshot(2, power=40)
+            data['future_extension'] = {'ignored': True}
+            client.sendall(frame(snapshot()) + frame(data))
+        result = self.cable(exchange)
+        self.assertIn('valid=1 power=40.00', result)
 
-    def test_invalid_sensor_fields(self):
-        for sample in (b'1,2,3\n', SAMPLE.replace(b'12.06', b'nan', 1),
-                       SAMPLE.replace(b'12.06', b'inf', 1), SAMPLE.rstrip() + b',99\n',
-                       SAMPLE.replace(b'12.06', b'', 1), SAMPLE.replace(b'12.06', b'0x1p0', 1),
-                       b'x' * 1100 + b'\n'):
-            with self.subTest(sample=sample[:40]):
-                result, _ = self.cable(sample=sample)
-                self.assertNotIn('valid=1', result)
-                self.assertRegex(result, 'invalid sensor response|oversized response')
-
-    def test_timeout_does_not_block_polling(self):
-        result, commands = self.cable(silent=True)
-        self.assertIn('query timed out (4s)', result)
-        self.assertEqual(commands, [b'*IDN?'])
-        self.assertGreater(result.count('cable valid='), 80)
-
-    def test_serial_connection_and_timeout_from_config(self):
-        result, commands = self.cable(config_timeout=1)
+    def test_starting_error_and_recovery_without_reconnecting(self):
+        def exchange(client, _):
+            for data in (unavailable('starting', 1), snapshot(2),
+                         unavailable('error', 3), snapshot(4, power=50)):
+                client.sendall(frame(data))
+                time.sleep(.12)
+        result = self.cable(exchange, loops=16)
+        self.assertIn('nvpowermon starting', result)
         self.assertIn('valid=1 power=27.48', result)
-        self.assertEqual(commands, [b'*IDN?', b'SENSORDATA?'])
-        result, _ = self.cable(config_timeout=0.25, silent=True)
-        self.assertIn('query timed out (0.25s)', result)
+        self.assertIn('valid=0 power=0.00 connector=0.00 controller=0.00 message=Cable: 串口已断开', result)
+        self.assertIn('valid=1 power=50.00', result)
 
-    def test_disconnect_clears_previous_validity(self):
-        result, _ = self.cable(disconnect=True)
+    def test_invalid_metadata_and_required_fields(self):
+        changes = [
+            ('schema_version', 2), ('schema_version', True), ('sequence', 0), ('sequence', True),
+            ('valid', 1), ('valid', False), ('state', 'other'), ('id', 'OTHER DEVICE'),
+            ('device', None), ('status', None), ('device_config', None), ('time', 123),
+            ('device', []), ('status', 12), ('device_config', []),
+            ('sample_monotonic_s', True), ('sample_monotonic_s', float('nan')),
+        ]
+        for key, value in changes:
+            with self.subTest(key=key, value=value):
+                def exchange(client, _, key=key, value=value):
+                    data = snapshot()
+                    data[key] = value
+                    client.sendall(frame(data))
+                result = self.cable(exchange, loops=4)
+                self.assertNotIn('valid=1', result)
+                self.assertRegex(result, 'invalid nvpowermon|unsupported nvpowermon')
+        for location, key, value in (
+                ('status', 'total_power_w', float('inf')),
+                ('status', 'board_temperature_c', '43.5'),
+                ('device_config', 'alarm_temperature_c', True),
+                ('device_config', 'fan_control_type', 9)):
+            with self.subTest(location=location, key=key):
+                def exchange(client, _, location=location, key=key, value=value):
+                    data = snapshot()
+                    data[location][key] = value
+                    client.sendall(frame(data))
+                self.assertNotIn('valid=1', self.cable(exchange, loops=4))
+
+    def test_invalid_channels(self):
+        for change in ('missing', 'swapped', 'bool', 'null'):
+            with self.subTest(change=change):
+                def exchange(client, _):
+                    data = snapshot()
+                    channels = data['status']['channels']
+                    if change == 'missing':
+                        channels.pop()
+                    elif change == 'swapped':
+                        channels.reverse()
+                    elif change == 'bool':
+                        channels[0]['current_a'] = True
+                    else:
+                        channels[0] = None
+                    client.sendall(frame(data))
+                result = self.cable(exchange, loops=4)
+                self.assertNotIn('valid=1', result)
+                self.assertIn('invalid nvpowermon', result)
+
+    def test_invalid_json_utf8_and_frame_size(self):
+        for data in (b'{} garbage\n', b'[]\n', b'{"schema_version":1,}\n',
+                     b'\xff\n', b'{}\0\n', b'\n', frame(snapshot()).rstrip() + b'{}\n', b'x' * 65536):
+            with self.subTest(data=data[:30]):
+                result = self.cable(lambda client, _: client.sendall(data), loops=4)
+                self.assertNotIn('valid=1', result)
+                self.assertRegex(result, 'invalid nvpowermon JSON|oversized nvpowermon frame')
+
+    def test_frame_size_exact_limit(self):
+        def exchange(client, _):
+            data = snapshot()
+            data['padding'] = ''
+            data['padding'] = 'x' * (65536 - len(frame(data)))
+            self.assertEqual(len(frame(data)), 65536)
+            client.sendall(frame(data))
+        self.assertIn('valid=1', self.cable(exchange))
+
+    def test_invalid_frame_clears_previous_reading(self):
+        def exchange(client, _):
+            client.sendall(frame(snapshot()))
+            time.sleep(.15)
+            client.sendall(b'broken\n')
+        result = self.cable(exchange)
         self.assertIn('valid=1', result)
         self.assertIn('valid=0', result.split('valid=1', 1)[1])
-        self.assertIn('Cable disconnected', result)
+        self.assertIn('invalid nvpowermon JSON', result)
 
-    def test_busy_port_not_opened(self):
-        master, slave = pty.openpty()
-        try:
-            result = subprocess.check_output([str(BUILD / 'hardware-probe'), '1', 'cable'],
-                        env=dict(os.environ, HTOP_POWER_CABLE_PORT=os.ttyname(slave)), text=True)
-            self.assertIn('Cable busy', result)
-            self.assertFalse(select.select([master], [], [], 0)[0])
-        finally:
-            os.close(master)
-            os.close(slave)
+    def test_stale_cached_and_future_samples(self):
+        for age in (11, -5):
+            with self.subTest(age=age):
+                result = self.cable(lambda client, _: client.sendall(frame(snapshot(age=age))), loops=4)
+                self.assertNotIn('valid=1', result)
+                self.assertIn('stale data', result)
 
-    def test_disabled_and_missing_cable(self):
-        for port, message in (('off', 'Cable disabled'),
-                              ('/dev/htop_plus-device-does-not-exist', 'Cable unavailable')):
-            with self.subTest(port=port):
+    def test_freshness_checked_without_new_frames(self):
+        result = self.cable(lambda client, _: client.sendall(frame(snapshot(age=9.5))), loops=22)
+        self.assertIn('valid=1', result)
+        self.assertIn('stale data / no recent sample', result)
+        self.assertIn('valid=0', result.split('valid=1', 1)[1])
+
+    def test_old_sequences_ignored(self):
+        def exchange(client, _):
+            client.sendall(frame(snapshot(42, power=42)) + frame(snapshot(42, power=99)) +
+                           frame(snapshot(1, power=99)))
+        result = self.cable(exchange)
+        self.assertIn('valid=1 power=42.00', result)
+        self.assertNotIn('power=99.00', result)
+
+    def test_disconnect_and_restart_reset_sequence(self):
+        def exchange(client, number):
+            client.sendall(frame(snapshot(42 if number == 0 else 1, power=42 if number == 0 else 55)))
+            if number == 0:
+                time.sleep(.15)
+        result = self.cable(exchange, loops=125, connections=2)
+        self.assertIn('valid=1 power=42.00', result)
+        self.assertIn('nvpowermon disconnected', result)
+        self.assertIn('valid=1 power=55.00', result)
+
+    def test_parallel_subscribers(self):
+        # The first exchange returns immediately so both peers are accepted.
+        def exchange(client, number):
+            client.sendall(frame(snapshot()))
+            if number == 0:
+                time.sleep(.2)
+        outputs = self.cable(exchange, loops=12, connections=2, clients=2)
+        for result in outputs:
+            self.assertIn('valid=1 power=27.48', result)
+            self.assertNotIn('disconnected', result)
+
+    def test_silent_service_timeout_does_not_block_polling(self):
+        result = self.cable(lambda client, _: None, loops=310)
+        self.assertIn('subscription timed out', result)
+        self.assertGreater(result.count('cable valid='), 300)
+
+    def test_disabled_missing_socket_and_legacy_serial_override(self):
+        for changes, message in (
+                ({'HTOP_POWER_CABLE_SOCKET': 'off'}, 'Cable disabled'),
+                ({'HTOP_POWER_CABLE_PORT': 'off'}, 'Cable disabled'),
+                ({'HTOP_POWER_CABLE_SOCKET': '/tmp/htop_plus-no-such-service.sock'}, 'service unavailable'),
+                ({'HTOP_POWER_CABLE_SOCKET': 'relative.sock'}, 'invalid nvpowermon socket path'),
+                ({'HTOP_POWER_CABLE_PORT': '/dev/ttyACM0'}, 'configure the device in nvpowermon')):
+            with self.subTest(changes=changes):
+                env = {k: v for k, v in os.environ.items() if not k.startswith('HTOP_POWER_CABLE_')}
                 result = subprocess.check_output([str(BUILD / 'hardware-probe'), '1', 'cable'],
-                            env=dict(os.environ, HTOP_POWER_CABLE_PORT=port), text=True)
+                                                 env=dict(env, **changes), text=True)
                 self.assertIn('valid=0', result)
                 self.assertIn(message, result)
-
-    def resolve(self, config, devices=(), raw=None):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            sysroot = root / 'sys'
-            devroot = root / 'dev'
-            sysroot.mkdir()
-            devroot.mkdir()
-            for name, serial, vid, pid in devices:
-                usb = root / 'usb' / name
-                interface = usb / 'interface'
-                interface.mkdir(parents=True)
-                for key, value in (('serial', serial), ('idVendor', vid), ('idProduct', pid)):
-                    (usb / key).write_text(value + '\n')
-                tty = sysroot / name
-                tty.mkdir()
-                (tty / 'device').symlink_to(interface)
-                (devroot / name).touch()
-            path = root / 'config.json'
-            path.write_text(json.dumps(config) if raw is None else raw)
-            return subprocess.run([str(BUILD / 'config-probe'), str(path), str(sysroot), str(devroot)],
-                                  text=True, stdout=subprocess.PIPE, check=False)
-
-    def test_config_serial_selects_current_port_and_usb_ids(self):
-        config = {'usb_serial': 'wanted', 'usb_vid': '1A86', 'usb_pid': '55D3',
-                  'port': '/dev/ttyACM0', 'baudrate': 115200, 'timeout_seconds': 2.5}
-        result = self.resolve(config, (('ttyACM0', 'other', '1a86', '55d3'),
-                                       ('ttyACM7', 'wanted', '1a86', '55d3')))
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn('/dev/ttyACM7 serial=wanted vid=1a86 pid=55d3 timeout=2.5', result.stdout)
-
-    def test_config_no_serial_match_never_falls_back(self):
-        config = {'usb_serial': 'missing', 'port': '/dev/ttyACM0'}
-        result = self.resolve(config, (('ttyACM0', 'other', '1a86', '55d3'),))
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('no fallback', result.stdout)
-
-    def test_config_duplicate_serial_and_wrong_vid(self):
-        devices = (('ttyACM0', 'same', '1a86', '55d3'), ('ttyACM1', 'same', '1a86', '55d3'))
-        result = self.resolve({'usb_serial': 'same'}, devices)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('multiple ports', result.stdout)
-        result = self.resolve({'usb_serial': 'same', 'usb_vid': '1234'}, devices)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('no fallback', result.stdout)
-
-    def test_config_null_serial_uses_explicit_port(self):
-        result = self.resolve({'usb_serial': None, 'port': '/dev/ttyACM9'})
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn('port=/dev/ttyACM9', result.stdout)
-
-    def test_config_invalid_json_and_fields(self):
-        for raw in ('{} garbage', '{"port":"/dev/ttyACM0",}', '[]'):
-            with self.subTest(raw=raw):
-                self.assertEqual(self.resolve({}, raw=raw).returncode, 1)
-        for extra in ({'timeout_seconds': 0}, {'timeout_seconds': True}, {'timeout_seconds': None},
-                      {'baudrate': 9600}, {'baudrate': '115200'}, {'usb_vid': 'zzzz'},
-                      {'usb_serial': ''}, {'usb_serial': 123}, {'port': 'ttyACM0'}, {'unknown': 1}):
-            with self.subTest(extra=extra):
-                result = self.resolve(dict({'port': '/dev/ttyACM0'}, **extra))
-                self.assertEqual(result.returncode, 1, result.stdout)
 
 
 if __name__ == '__main__':

@@ -1,42 +1,38 @@
 /*
 htop - linux/PowerCable.c
 Released under the GNU GPLv2+, see the COPYING file.
-Protocol: WINGSTUDIO 12V-2X6 Ti firmware, ASCII 115200 8N1.
+Read-only subscriber to the nvpowermon socket protocol v1.
 */
 
 #include "config.h" // IWYU pragma: keep
 
 #include "linux/PowerCable.h"
 
-#include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <glob.h>
-#include <limits.h>
 #include <math.h>
 #include <poll.h>
-#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/file.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+#include <json-c/json.h>
 
 #include "XUtils.h"
-#include "linux/CableConfig.h"
 
 
 static PowerCableReading reading;
-static int serialFd = -1;
-static enum { CABLE_CLOSED, CABLE_ID, CABLE_SENSOR, CABLE_IDLE } state;
-static char buffer[1024];
+static int socketFd = -1;
+static bool connecting;
+/* The protocol limit includes LF; reserve one byte for the terminating NUL. */
+static char buffer[65536];
 static size_t buffered;
+static int64_t lastSequence;
 static double deadline;
-static double nextQuery;
-static double queryTimeout = 4.0;
+static double nextConnect;
 
 static double PowerCable_now(void) {
    struct timespec ts;
@@ -45,220 +41,273 @@ static double PowerCable_now(void) {
 }
 
 void PowerCable_done(void) {
-   if (serialFd >= 0)
-      close(serialFd);
-   serialFd = -1;
-   state = CABLE_CLOSED;
+   if (socketFd >= 0)
+      close(socketFd);
+   socketFd = -1;
+   connecting = false;
    buffered = 0;
+   lastSequence = 0;
+   nextConnect = 0;
    reading.valid = false;
 }
 
 static void PowerCable_fail(const char* message, double now) {
    PowerCable_done();
    xSnprintf(reading.message, sizeof(reading.message), "%s", message);
-   nextQuery = now + 5.0;
-}
-
-/* Check existing visible readers too: TIOCEXCL only prevents future opens. */
-static bool PowerCable_inUse(const char* port) {
-   char target[PATH_MAX];
-   if (!realpath(port, target))
-      return false;
-   glob_t paths = {0};
-   bool used = false;
-   if (glob("/proc/[0-9]*/fd/*", 0, NULL, &paths) == 0) {
-      for (size_t i = 0; i < paths.gl_pathc; i++) {
-         char link[PATH_MAX];
-         ssize_t len = readlink(paths.gl_pathv[i], link, sizeof(link) - 1);
-         if (len < 0)
-            continue;
-         link[len] = '\0';
-         if (String_eq(link, target)) {
-            used = true;
-            break;
-         }
-      }
-   }
-   globfree(&paths);
-   return used;
-}
-
-static bool PowerCable_send(bool identity, double now) {
-   const char* command = identity ? "*IDN?\n" : "SENSORDATA?\n";
-   size_t length = strlen(command);
-   if (write(serialFd, command, length) != (ssize_t)length) {
-      PowerCable_fail("Cable: serial write failed", now);
-      return false;
-   }
-   state = identity ? CABLE_ID : CABLE_SENSOR;
-   deadline = now + queryTimeout;
-   return true;
+   nextConnect = now + 5.0;
 }
 
 static void PowerCable_open(double now) {
-   const char* port = getenv("HTOP_POWER_CABLE_PORT");
-   char selected[PATH_MAX];
-   if (port && String_eq(port, "off")) {
-      PowerCable_fail("Cable disabled (HTOP_POWER_CABLE_PORT=off)", now);
+   const char* path = getenv("HTOP_POWER_CABLE_SOCKET");
+   if (!path || !*path)
+      path = getenv("NVPOWERMON_SOCKET");
+   if (!path || !*path)
+      path = "/run/nvpowermon/status.sock";
+   const char* oldPort = getenv("HTOP_POWER_CABLE_PORT");
+   if (String_eq(path, "off") || (oldPort && String_eq(oldPort, "off"))) {
+      PowerCable_fail("Cable disabled", now);
       return;
    }
-   if (!port || !*port) {
-      const char* path = getenv("HTOP_POWER_CABLE_CONFIG");
-      if (!path || !*path)
-         path = "/etc/nvpowermon/config.json";
-      CableConfig config;
-      char error[160];
-      if (!CableConfig_load(path, &config, error, sizeof(error)) ||
-          !CableConfig_resolve(&config, "/sys/class/tty", "/dev", selected, sizeof(selected), error, sizeof(error))) {
-         PowerCable_fail(error, now);
+   if ((oldPort && *oldPort) || getenv("HTOP_POWER_CABLE_CONFIG")) {
+      PowerCable_fail("Cable: configure the device in nvpowermon; use HTOP_POWER_CABLE_SOCKET", now);
+      return;
+   }
+   struct sockaddr_un address = { .sun_family = AF_UNIX };
+   if (*path != '/' || strlen(path) >= sizeof(address.sun_path)) {
+      PowerCable_fail("Cable: invalid nvpowermon socket path", now);
+      return;
+   }
+   xSnprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+   socketFd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+   if (socketFd < 0) {
+      PowerCable_fail("Cable: cannot create nvpowermon socket", now);
+      return;
+   }
+   if (connect(socketFd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+      if (errno != EINPROGRESS) {
+         PowerCable_fail(errno == EACCES ? "Cable: nvpowermon socket permission denied" :
+                         "Cable: service unavailable; run sudo nvpowermon --start", now);
          return;
       }
-      queryTimeout = config.timeout;
-      port = selected;
-   } else {
-      queryTimeout = 4.0;
+      connecting = true;
    }
-   if (!String_startsWith(port, "/dev/")) {
-      PowerCable_fail("Cable port must be an absolute /dev/ path", now);
-      return;
-   }
-   if (PowerCable_inUse(port)) {
-      PowerCable_fail("Cable busy: close other serial monitors", now);
-      return;
-   }
-   serialFd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
-   if (serialFd < 0) {
-      PowerCable_fail(errno == EACCES ? "Cable permission denied (dialout group)" : "Cable unavailable / busy", now);
-      return;
-   }
-   struct stat st;
-   struct termios attrs;
-   if (fstat(serialFd, &st) != 0 || !S_ISCHR(st.st_mode) ||
-       flock(serialFd, LOCK_EX | LOCK_NB) != 0 || ioctl(serialFd, TIOCEXCL) != 0 ||
-       tcgetattr(serialFd, &attrs) != 0) {
-      PowerCable_fail("Cable: exclusive serial access failed", now);
-      return;
-   }
-   attrs.c_iflag = attrs.c_oflag = attrs.c_lflag = 0;
-   /* Do not toggle DTR/RTS, send BREAK, or request a line drop on close. */
-   attrs.c_cflag = CS8 | CREAD | CLOCAL;
-   attrs.c_cc[VMIN] = attrs.c_cc[VTIME] = 0;
-   cfsetispeed(&attrs, B115200);
-   cfsetospeed(&attrs, B115200);
-   if (tcsetattr(serialFd, TCSANOW, &attrs) != 0 || tcflush(serialFd, TCIFLUSH) != 0) {
-      PowerCable_fail("Cable: serial setup failed", now);
-      return;
-   }
-   xSnprintf(reading.message, sizeof(reading.message), "Cable: verifying device ID...");
-   PowerCable_send(true, now);
+   deadline = now + 15.0;
+   xSnprintf(reading.message, sizeof(reading.message), "Cable: waiting for nvpowermon...");
 }
 
-static bool PowerCable_parse(const char* line, double now) {
-   double values[15];
-   for (size_t i = 0; i < 15; i++) {
-      while (isspace((unsigned char)*line))
-         line++;
-      /* strtod accepts nan/inf, hexadecimal and empty fields: reject them. */
-      if (!isdigit((unsigned char)*line) && *line != '-' && *line != '+' && *line != '.')
-         return false;
-      char* end;
-      errno = 0;
-      values[i] = strtod(line, &end);
-      if (end == line || errno != 0 || !isfinite(values[i]))
-         return false;
-      for (const char* c = line; c < end; c++)
-         if (!isdigit((unsigned char)*c) && *c != '+' && *c != '-' && *c != '.' && *c != 'e' && *c != 'E')
-            return false;
-      line = end;
-      while (isspace((unsigned char)*line))
-         line++;
-      if (i < 14) {
-         if (*line++ != ',')
-            return false;
-      } else if (*line != '\0') {
-         return false;
-      }
-   }
-   for (size_t i = 0; i < 6; i++) {
-      reading.voltage[i] = values[2 * i];
-      reading.current[i] = values[2 * i + 1];
-   }
-   reading.power = values[12];
-   reading.connectorTemperature = values[13];
-   reading.controllerTemperature = values[14];
-   reading.updated = now;
-   reading.valid = true;
-   reading.message[0] = '\0';
-   return true;
+static struct json_object* PowerCable_field(struct json_object* root, const char* key, enum json_type type) {
+   struct json_object* value;
+   if (!json_object_is_type(root, json_type_object) ||
+       !json_object_object_get_ex(root, key, &value) || !json_object_is_type(value, type))
+      return NULL;
+   return value;
 }
 
-static bool PowerCable_line(double now) {
-   buffer[buffered] = '\0';
-   if (!buffered)
-      return true;
-   if (state == CABLE_ID) {
-      if (!String_startsWith(buffer, "WINGSTUDIO 12V-2X6 Ti V")) {
-         PowerCable_fail("Cable: wrong device ID", now);
-         return false;
-      }
-      xSnprintf(reading.message, sizeof(reading.message), "Cable: reading sensors...");
-      return PowerCable_send(false, now);
-   }
-   if (state != CABLE_SENSOR || !PowerCable_parse(buffer, now)) {
-      PowerCable_fail("Cable: invalid sensor response", now);
+static const char* PowerCable_string(struct json_object* root, const char* key) {
+   struct json_object* value = PowerCable_field(root, key, json_type_string);
+   if (!value)
+      return NULL;
+   const char* text = json_object_get_string(value);
+   return strlen(text) == (size_t)json_object_get_string_len(value) ? text : NULL;
+}
+
+static bool PowerCable_number(struct json_object* root, const char* key, double* out) {
+   struct json_object* value;
+   if (!json_object_is_type(root, json_type_object) || !json_object_object_get_ex(root, key, &value) ||
+       (!json_object_is_type(value, json_type_int) && !json_object_is_type(value, json_type_double)))
       return false;
+   *out = json_object_get_double(value);
+   return isfinite(*out);
+}
+
+/* Older json-c versions do not validate UTF-8. Reject invalid byte sequences
+ * before parsing, including overlong encodings, surrogates and embedded NUL. */
+static bool PowerCable_utf8(const unsigned char* text, size_t size) {
+   for (size_t i = 0; i < size; ) {
+      unsigned int c = text[i++];
+      if (c == 0)
+         return false;
+      if (c < 0x80)
+         continue;
+      unsigned int count, minimum;
+      if (c >= 0xc2 && c <= 0xdf) {
+         count = 1;
+         minimum = 0x80;
+         c &= 0x1f;
+      } else if (c >= 0xe0 && c <= 0xef) {
+         count = 2;
+         minimum = 0x800;
+         c &= 0x0f;
+      } else if (c >= 0xf0 && c <= 0xf4) {
+         count = 3;
+         minimum = 0x10000;
+         c &= 0x07;
+      } else {
+         return false;
+      }
+      if (count > size - i)
+         return false;
+      while (count--) {
+         unsigned int next = text[i++];
+         if ((next & 0xc0) != 0x80)
+            return false;
+         c = (c << 6) | (next & 0x3f);
+      }
+      if (c < minimum || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff))
+         return false;
    }
-   state = CABLE_IDLE;
-   nextQuery = now + 2.0;
    return true;
+}
+
+static const char* PowerCable_snapshot(struct json_object* root, double now) {
+   struct json_object* version = PowerCable_field(root, "schema_version", json_type_int);
+   if (!version || json_object_get_int64(version) != 1)
+      return "Cable: unsupported nvpowermon protocol";
+   struct json_object* sequence = PowerCable_field(root, "sequence", json_type_int);
+   struct json_object* valid = PowerCable_field(root, "valid", json_type_boolean);
+   const char* state = PowerCable_string(root, "state");
+   if (!sequence || json_object_get_int64(sequence) < 1 || !valid || !state ||
+       (!String_eq(state, "ok") && !String_eq(state, "starting") && !String_eq(state, "error")) ||
+       (bool)json_object_get_boolean(valid) != String_eq(state, "ok"))
+      return "Cable: invalid nvpowermon metadata";
+
+   PowerCableReading sample = {0};
+   if (json_object_get_boolean(valid)) {
+      struct json_object* device = PowerCable_field(root, "device", json_type_object);
+      struct json_object* status = PowerCable_field(root, "status", json_type_object);
+      struct json_object* config = PowerCable_field(root, "device_config", json_type_object);
+      struct json_object* channels = PowerCable_field(status, "channels", json_type_array);
+      const char* id = PowerCable_string(root, "id");
+      if (!PowerCable_string(root, "time") || !PowerCable_string(device, "port") ||
+          !id || !String_startsWith(id, "WINGSTUDIO 12V-2X6 Ti V") ||
+          !channels || json_object_array_length(channels) != 6 ||
+          !PowerCable_number(root, "sample_monotonic_s", &sample.updated))
+         return "Cable: invalid nvpowermon snapshot";
+      if (now - sample.updated < 0 || now - sample.updated > 10.0)
+         return "Cable: stale data / invalid sample time";
+      for (size_t i = 0; i < 6; i++) {
+         struct json_object* channel = json_object_array_get_idx(channels, i);
+         const char* name = PowerCable_string(channel, "channel");
+         if (!name || name[0] != (char)('A' + i) || name[1] != '\0' ||
+             !PowerCable_number(channel, "voltage_v", &sample.voltage[i]) ||
+             !PowerCable_number(channel, "current_a", &sample.current[i]))
+            return "Cable: invalid nvpowermon channel";
+      }
+      if (!PowerCable_number(status, "total_power_w", &sample.power) ||
+          !PowerCable_number(status, "cable_temperature_c", &sample.connectorTemperature) ||
+          !PowerCable_number(status, "board_temperature_c", &sample.controllerTemperature))
+         return "Cable: invalid nvpowermon sensors";
+      static const char* const fields[] = {
+         "screen_rotation", "shunt_resistance_milliohm", "current_correction_rate",
+         "fan_control_type", "fan_on_temperature_c", "alarm_temperature_c",
+         "alarm_current_per_channel_a", "alarm_timeout_s", "protection_current_per_channel_a",
+         "protection_temperature_c",
+      };
+      for (size_t i = 0; i < ARRAYSIZE(fields); i++) {
+         double value;
+         if (!PowerCable_number(config, fields[i], &value) ||
+             (String_eq(fields[i], "fan_control_type") && (value < 0 || value > 2 || floor(value) < value)))
+            return "Cable: invalid nvpowermon device configuration";
+      }
+      sample.valid = true;
+   } else if (String_eq(state, "error")) {
+      const char* error = PowerCable_string(root, "error");
+      if (!error)
+         return "Cable: invalid nvpowermon error";
+      size_t size = strnlen(error, sizeof(sample.message) - 8);
+      /* Truncate at a UTF-8 boundary and keep control characters off screen. */
+      while (size && ((unsigned char)error[size] & 0xc0) == 0x80)
+         size--;
+      xSnprintf(sample.message, sizeof(sample.message), "Cable: %.*s", (int)size, error);
+      for (char* c = sample.message; *c; c++)
+         if ((unsigned char)*c < 32 || *c == 127)
+            *c = ' ';
+   } else {
+      xSnprintf(sample.message, sizeof(sample.message), "Cable: nvpowermon starting...");
+   }
+   /* Sequence numbers are scoped to this connection, not the service lifetime. */
+   int64_t number = json_object_get_int64(sequence);
+   if (number > lastSequence) {
+      lastSequence = number;
+      reading = sample;
+      deadline = now + (String_eq(state, "starting") ? 15.0 : 10.0);
+   }
+   return NULL;
+}
+
+static bool PowerCable_line(void) {
+   double now = PowerCable_now();
+   const char* error = "Cable: invalid nvpowermon JSON";
+   if (PowerCable_utf8((const unsigned char*)buffer, buffered)) {
+      buffer[buffered] = '\0';
+      struct json_tokener* tokener = json_tokener_new();
+      if (tokener) {
+         json_tokener_set_flags(tokener, JSON_TOKENER_STRICT);
+         struct json_object* root = json_tokener_parse_ex(tokener, buffer, buffered + 1);
+         if (json_tokener_get_error(tokener) == json_tokener_success &&
+             json_object_is_type(root, json_type_object))
+            error = PowerCable_snapshot(root, now);
+         json_object_put(root);
+         json_tokener_free(tokener);
+      }
+   }
+   if (error)
+      PowerCable_fail(error, now);
+   return !error;
 }
 
 const PowerCableReading* PowerCable_get(void) {
    double now = PowerCable_now();
-   if (reading.valid && now - reading.updated > 10.0) {
-      PowerCable_fail("Cable: stale data / no recent sample", now);
-      return &reading;
-   }
-   if (state == CABLE_CLOSED) {
-      if (now >= nextQuery)
-         PowerCable_open(now);
-      return &reading;
-   }
-   if (state == CABLE_IDLE && now >= nextQuery && !PowerCable_send(false, now))
+   if (socketFd < 0 && now >= nextConnect)
+      PowerCable_open(now);
+   if (socketFd < 0)
       return &reading;
 
-   struct pollfd pfd = { .fd = serialFd, .events = POLLIN };
-   if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) {
-      PowerCable_fail("Cable disconnected / serial hangup", now);
-      return &reading;
-   }
-
-   /* A bounded drain prevents noisy or faulty devices from monopolizing UI. */
-   char incoming[1024];
-   ssize_t size = read(serialFd, incoming, sizeof(incoming));
-   if (size < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-      PowerCable_fail("Cable disconnected / serial read failed", now);
-      return &reading;
-   }
-   for (ssize_t i = 0; i < size; i++) {
-      unsigned char c = incoming[i];
-      if (c == '\r')
-         continue;
-      if (c == '\n') {
-         if (!PowerCable_line(now))
+   if (connecting) {
+      struct pollfd pfd = { .fd = socketFd, .events = POLLOUT };
+      if (poll(&pfd, 1, 0) > 0) {
+         int error = 0;
+         socklen_t size = sizeof(error);
+         if (getsockopt(socketFd, SOL_SOCKET, SO_ERROR, &error, &size) < 0 || error ||
+             !(pfd.revents & POLLOUT)) {
+            PowerCable_fail("Cable: nvpowermon connection failed", now);
             return &reading;
-         buffered = 0;
-      } else if (c < 32 || c > 126 || buffered >= sizeof(buffer) - 1) {
-         PowerCable_fail("Cable: malformed / oversized response", now);
-         return &reading;
-      } else {
-         buffer[buffered++] = c;
+         }
+         connecting = false;
       }
    }
-   if ((state == CABLE_ID || state == CABLE_SENSOR) && now >= deadline) {
-      char message[80];
-      xSnprintf(message, sizeof(message), "Cable: query timed out (%gs)", queryTimeout);
-      PowerCable_fail(message, now);
+   /* Bound work per refresh even if a faulty peer continuously sends data. */
+   for (unsigned int batch = 0; !connecting && batch < 16; batch++) {
+      char incoming[4096];
+      ssize_t size = recv(socketFd, incoming, sizeof(incoming), 0);
+      if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+         break;
+      if (size <= 0) {
+         PowerCable_fail("Cable: nvpowermon disconnected", now);
+         return &reading;
+      }
+      for (ssize_t i = 0; i < size; i++) {
+         if (incoming[i] == '\n') {
+            if (!PowerCable_line())
+               return &reading;
+            buffered = 0;
+         } else if (buffered >= sizeof(buffer) - 1) {
+            PowerCable_fail("Cable: oversized nvpowermon frame", now);
+            return &reading;
+         } else {
+            buffer[buffered++] = incoming[i];
+         }
+      }
+   }
+   now = PowerCable_now();
+   if (reading.valid && now - reading.updated > 10.0) {
+      PowerCable_fail("Cable: stale data / no recent sample", now);
+   } else if (now >= deadline) {
+      PowerCable_fail("Cable: nvpowermon subscription timed out", now);
+   } else {
+      struct pollfd pfd = { .fd = socketFd, .events = POLLIN };
+      if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)))
+         PowerCable_fail("Cable: nvpowermon disconnected", now);
    }
    return &reading;
 }

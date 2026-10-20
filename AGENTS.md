@@ -5,7 +5,7 @@ This file provides guidance to AI coding agents working with code in this reposi
 ## Build Commands
 
 ```bash
-# Build for local platform - htop binary
+# Build for local platform - htop_plus binary
 ./autogen.sh && ./configure && make
 
 # Build with Performance Co-Pilot (PCP) support - pcp-htop binary
